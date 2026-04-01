@@ -1,0 +1,117 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# deploy.yml — CI/CD Pipeline: Vespa Catalog
+# ─────────────────────────────────────────────────────────────────────────────
+# Alur kerja:
+#   Push ke branch main
+#     → Copy index.html ke EC2 via SSH
+#     → Install Nginx (jika belum ada)
+#     → Deploy frontend ke /var/www/html
+#     → Restart Nginx
+#     → Deploy & restart Node.js backend via PM2
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Deploy Vespa Catalog
+
+on:
+  push:
+    branches:
+      - main   # Hanya trigger saat push ke branch main (bukan branch lain)
+
+jobs:
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest  # GitHub-hosted runner (gratis)
+
+    steps:
+
+      # ── Step 1: Checkout kode dari repository ──────────────────────────────
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── Step 2: Deploy ke EC2 via SSH ──────────────────────────────────────
+      #
+      # WHY SSH secrets?
+      # ─────────────────
+      # Kita TIDAK boleh menyimpan IP, username, atau private key langsung di
+      # file YAML ini. Alasannya:
+      #
+      #   - File .yml ini ada di repository (bisa dilihat semua contributor).
+      #   - GitHub Secrets dienkripsi dan hanya terbaca saat workflow berjalan.
+      #   - Prinsip "least privilege" — hanya GitHub Actions yang perlu tahu.
+      #
+      # Cara set secrets:
+      #   GitHub Repo → Settings → Secrets and variables → Actions → New secret
+      #
+      #   EC2_HOST       = Public IP atau domain EC2 kamu (e.g., 13.250.xx.xx)
+      #   EC2_USER       = Username SSH (e.g., ubuntu / ec2-user / admin)
+      #   EC2_SSH_KEY    = Isi file .pem kamu (paste seluruh isinya, termasuk -----BEGIN-----)
+      #
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host:        ${{ secrets.EC2_HOST }}
+          username:    ${{ secrets.EC2_USER }}
+          key:         ${{ secrets.EC2_SSH_KEY }}
+          script: |
+
+            # ── Install Nginx jika belum ada ─────────────────────────────────
+            # "command -v nginx" mengembalikan path nginx jika sudah terinstall.
+            # Jika tidak ada, baru kita install.
+            if ! command -v nginx &> /dev/null; then
+              echo "📦 Nginx belum ada, menginstall..."
+              sudo apt-get update -y
+              sudo apt-get install -y nginx
+              sudo systemctl enable nginx
+            else
+              echo "✅ Nginx sudah terinstall, skip."
+            fi
+
+            # ── Buat direktori kerja untuk backend ───────────────────────────
+            mkdir -p ~/vespa-catalog
+
+            # ── Copy index.html ke direktori Nginx ───────────────────────────
+            # /var/www/html adalah root default Nginx.
+            # File yang ada di sini langsung bisa diakses via http://EC2_IP/
+            sudo cp ~/vespa-catalog/index.html /var/www/html/index.html
+            echo "🌐 Frontend sudah di-copy ke /var/www/html/"
+
+            # ── Restart Nginx ─────────────────────────────────────────────────
+            sudo systemctl restart nginx
+            echo "🔄 Nginx berhasil di-restart."
+
+            # ── Deploy Backend (Node.js) ──────────────────────────────────────
+            # Install Node.js jika belum ada
+            if ! command -v node &> /dev/null; then
+              echo "📦 Node.js belum ada, menginstall..."
+              curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+              sudo apt-get install -y nodejs
+            fi
+
+            # Install PM2 secara global jika belum ada
+            # PM2 adalah process manager — menjaga Node.js tetap hidup walau terminal ditutup.
+            if ! command -v pm2 &> /dev/null; then
+              echo "📦 PM2 belum ada, menginstall..."
+              sudo npm install -g pm2
+            fi
+
+            # Masuk ke folder backend dan install dependencies
+            cd ~/vespa-catalog
+            npm install --omit=dev
+
+            # Restart app dengan PM2 (atau start jika belum pernah dijalankan)
+            pm2 restart vespa-api 2>/dev/null || pm2 start server.js --name vespa-api
+            pm2 save   # Simpan konfigurasi PM2 agar auto-start setelah reboot
+            echo "🚀 Backend (PM2: vespa-api) berhasil di-restart."
+
+      # ── Step 3: Copy file ke EC2 via SCP ───────────────────────────────────
+      # Kita copy file sebelum menjalankan script di atas.
+      # (Urutkan step ini SEBELUM step Deploy via SSH di workflow nyata)
+      # Di sini diletakkan di bawah hanya untuk kejelasan dokumentasi.
+      - name: Copy files to EC2
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host:     ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key:      ${{ secrets.EC2_SSH_KEY }}
+          source:   "index.html,server.js,package.json,package-lock.json"
+          target:   "~/vespa-catalog"
